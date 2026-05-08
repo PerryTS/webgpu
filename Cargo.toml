@@ -1,0 +1,52 @@
+[package]
+name = "perry-ext-webgpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native bindings for the WebGPU spec (backed by `wgpu`) for the Perry TypeScript-to-native compiler. Spec-faithful surface so shaders + pipelines authored against the browser WebGPU API run unmodified under perry. Closes PerryTS/perry#571."
+repository = "https://github.com/PerryTS/webgpu"
+homepage = "https://github.com/PerryTS/webgpu"
+readme = "README.md"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Tracks the perry-ffi v0.5 ABI surface published from the
+# `PerryTS/perry` workspace. Pinned to a git rev rather than a
+# crates.io release until perry-ffi is published on crates.io —
+# same model as iroh-bindings.
+perry-ffi = { git = "https://github.com/PerryTS/perry", branch = "main" }
+
+# wgpu is the native implementation of the WebGPU spec. We track
+# the latest stable release; it carries naga (the WGSL compiler)
+# transitively so we don't need to depend on it directly.
+wgpu = "22"
+
+# Async dispatch — every WebGPU async method (`requestAdapter`,
+# `requestDevice`, `createComputePipelineAsync`, `mapAsync`,
+# `onSubmittedWorkDone`) routes through `spawn_blocking` + a
+# tokio `block_on` to wait on the wgpu future, mirroring the
+# iroh-bindings async pattern.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# pollster's `block_on` is needed for the no-runtime fallback in
+# `device.poll()` — wgpu's poll loop runs synchronously and we
+# don't always have a tokio runtime in scope when GC kicks in.
+pollster = "0.3"
+
+# Once wgpu surfaces a callback we have to materialise on the
+# main thread, parking_lot's lighter Mutex avoids contention vs.
+# std's poison-tracking variant.
+parking_lot = "0.12"
+
+# Descriptor passing: WebGPU's descriptor objects (`GPUBufferDescriptor`,
+# `GPUBindGroupLayoutDescriptor`, `GPURenderPipelineDescriptor`, …) are
+# deeply nested with many optional fields. Rather than exploding each
+# descriptor into a wide function-arg list, the TS side calls
+# `JSON.stringify(descriptor)` and we deserialize on the Rust side. This
+# keeps the FFI surface small (one descriptor JSON string + a few handles
+# per call) and the TS surface obvious (the object literal is the
+# argument exactly as in the spec).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
