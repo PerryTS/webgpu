@@ -1,6 +1,6 @@
 [package]
 name = "perry-ext-webgpu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Native bindings for the WebGPU spec (backed by `wgpu`) for the Perry TypeScript-to-native compiler. Spec-faithful surface so shaders + pipelines authored against the browser WebGPU API run unmodified under perry. Closes PerryTS/perry#571."
