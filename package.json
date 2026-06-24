@@ -1,6 +1,6 @@
 {
   "name": "@perryts/webgpu",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "WebGPU bindings (spec-faithful, backed by wgpu) for the Perry TypeScript-to-native compiler. Run browser-authored shaders + pipelines unmodified under perry.",
   "license": "MIT",
   "types": "src/index.ts",
