@@ -29,6 +29,12 @@
 //! - **v0.4.0** — `createRenderPipelineAsync` /
 //!   `createComputePipelineAsync` (the sync-call variants ship in
 //!   v0.1.0; the async variants are scaffolded but not load-bearing).
+//! - **v0.5.0** — on-screen surface (`GPUSurface` / `GPUCanvasContext`):
+//!   `requestSurface` / `surfaceFromNativeView` / `configure` /
+//!   `getCurrentTexture` / `present`, embedded into a perry-ui window
+//!   via its `embedNativeView` seam. macOS verified; other platforms
+//!   adopt a host-created view (see the "On-screen surface" section
+//!   in the README). Closes the issue's "on-screen canvas" carve-out.
 //!
 //! # Why a JSON-string descriptor channel
 //!
@@ -1501,8 +1507,9 @@ pub unsafe extern "C" fn js_webgpu_texture_create_view(
         _ => TextureViewDescriptor::default(),
     };
 
-    with_handle::<WGPUTexture, _, _>(texture_handle, |t| {
-        let view = t.0.create_view(&wgpu::TextureViewDescriptor {
+    // Build + register a view from whichever texture the handle names.
+    let make = |tex: &wgpu::Texture| -> Handle {
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
             label: parsed.label.as_deref(),
             format: parsed.format.as_deref().map(parse_texture_format),
             dimension: parsed
@@ -1524,7 +1531,22 @@ pub unsafe extern "C" fn js_webgpu_texture_create_view(
             },
         });
         register_handle(WGPUTextureView(view))
+    };
+
+    // A normal device texture.
+    if let Some(h) = with_handle::<WGPUTexture, _, _>(texture_handle, |t| make(&t.0)) {
+        return h;
+    }
+    // A swapchain texture from `surfaceGetCurrentTexture` — the live
+    // `SurfaceTexture` lives on the surface (it isn't cloneable), so
+    // borrow it back through the parent handle.
+    with_handle::<WGPUSurfaceTexture, _, _>(texture_handle, |st| {
+        with_handle::<WGPUSurface, _, _>(st.surface_handle, |s| {
+            s.current.lock().as_ref().map(|frame| make(&frame.texture))
+        })
+        .flatten()
     })
+    .flatten()
     .unwrap_or(0)
 }
 
@@ -3186,6 +3208,555 @@ pub unsafe extern "C" fn js_webgpu_command_encoder_copy_texture_to_texture(
             });
         });
     });
+}
+
+// ════════════════════════════════════════════════════════════════════
+// On-screen surface — `GPUSurface` / `GPUCanvasContext`
+// ════════════════════════════════════════════════════════════════════
+//
+// WebGPU presents to a window via a swapchain. The browser hides this
+// behind `canvas.getContext("webgpu")`; natively, wgpu wants a
+// `Surface` built from a platform window/view handle.
+//
+// Perry programs are headless by default, so on-screen rendering rides
+// on perry-ui: it owns the OS window and the main-thread event loop and
+// exposes one cross-platform seam — `perry_ui_embed_nsview(ptr)` — that
+// adopts an externally-created native view into the widget tree (the
+// symbol name is historical; on Windows it takes an `HWND`, on GTK a
+// widget pointer, on iOS/Android a `UIView`/Android `View`).
+//
+// The dependency direction matters: `@perryts/webgpu` must stay useful
+// headless (compute, render-to-texture), so it does **not** link
+// perry-ui. Instead:
+//
+//   1. `requestSurface({width,height})` allocates a GPU-capable native
+//      view, builds the `wgpu::Surface`, and returns a surface handle.
+//   2. `surfaceGetViewPtr(surface)` hands the raw view pointer back; the
+//      caller passes it to perry-ui's `embedNativeView()`.
+//   3. The usual configure / getCurrentTexture / render / present loop
+//      drives frames.
+//
+// `surfaceFromNativeView(ptr)` is the inverse seam: wrap a view the host
+// already created (the path for platforms whose toolkit owns the view,
+// and the hook a future "wrap an existing wgpu device" bloom-interop
+// entry point builds on).
+//
+// Threading: a swapchain surface must be configured / acquired /
+// presented on the thread that owns its backing layer — the main thread
+// under every platform's UI toolkit. Perry runs JS on the main thread,
+// so these calls are main-thread by construction; calling them from a
+// worker is undefined behaviour (same constraint as the spec, where
+// `GPUCanvasContext` lives on the `Window`).
+
+pub struct WGPUSurface {
+    surface: wgpu::Surface<'static>,
+    /// Pointer to a native view we allocated in `requestSurface` and own
+    /// (`0` when we merely wrapped a caller-supplied view — then we must
+    /// not release it). Released in `surfaceDrop`.
+    owned_view: i64,
+    /// The pointer handed back via `surfaceGetViewPtr` for embedding —
+    /// equal to `owned_view` for a created view, or the wrapped pointer.
+    view_ptr: i64,
+    /// Last applied configuration, kept so a resize can re-`configure`
+    /// with the same format/usage by only swapping width/height.
+    config: Mutex<Option<wgpu::SurfaceConfiguration>>,
+    /// The swapchain image acquired by `getCurrentTexture`, held until
+    /// `present` consumes it. `wgpu::SurfaceTexture` is neither `Clone`
+    /// nor splittable, so the frame lives here and the handle handed to
+    /// JS ([`WGPUSurfaceTexture`]) just points back at this surface.
+    current: Mutex<Option<wgpu::SurfaceTexture>>,
+    /// Handle of the [`WGPUSurfaceTexture`] currently issued to JS, so a
+    /// new acquire / a present can free the previous one and per-frame
+    /// handles don't accumulate.
+    issued_tex: Mutex<Handle>,
+}
+
+/// The handle `getCurrentTexture` returns. It carries no texture of its
+/// own — the live `SurfaceTexture` sits on the parent [`WGPUSurface`] —
+/// so `textureCreateView` resolves the texture by borrowing it back.
+/// This keeps the spec's two-step `getCurrentTexture().createView()`
+/// shape despite `wgpu::Texture` not being cloneable.
+pub struct WGPUSurfaceTexture {
+    pub surface_handle: Handle,
+}
+
+fn parse_present_mode(s: Option<&str>) -> wgpu::PresentMode {
+    match s.unwrap_or("fifo") {
+        "immediate" => wgpu::PresentMode::Immediate,
+        "mailbox" => wgpu::PresentMode::Mailbox,
+        "fifo-relaxed" => wgpu::PresentMode::FifoRelaxed,
+        // The spec's `GPUCanvasConfiguration` has no presentMode knob;
+        // FIFO (vsync) is the universally-supported default and matches
+        // the browser's implicit behaviour.
+        _ => wgpu::PresentMode::Fifo,
+    }
+}
+
+fn parse_alpha_mode(s: Option<&str>) -> wgpu::CompositeAlphaMode {
+    match s.unwrap_or("opaque") {
+        "premultiplied" => wgpu::CompositeAlphaMode::PreMultiplied,
+        "postmultiplied" => wgpu::CompositeAlphaMode::PostMultiplied,
+        "inherit" => wgpu::CompositeAlphaMode::Inherit,
+        "auto" => wgpu::CompositeAlphaMode::Auto,
+        _ => wgpu::CompositeAlphaMode::Opaque,
+    }
+}
+
+/// Reverse of [`parse_texture_format`] for the formats a swapchain
+/// actually reports. Not exhaustive over every `TextureFormat` — only
+/// the surface-capable set `getPreferredFormat` can return — with a
+/// `bgra8unorm` fallback (the most widely-supported swapchain format).
+fn surface_format_to_str(f: wgpu::TextureFormat) -> &'static str {
+    use wgpu::TextureFormat as F;
+    match f {
+        F::Bgra8Unorm => "bgra8unorm",
+        F::Bgra8UnormSrgb => "bgra8unorm-srgb",
+        F::Rgba8Unorm => "rgba8unorm",
+        F::Rgba8UnormSrgb => "rgba8unorm-srgb",
+        F::Rgba16Float => "rgba16float",
+        F::Rgb10a2Unorm => "rgb10a2unorm",
+        _ => "bgra8unorm",
+    }
+}
+
+/// `navigator.gpu` → request a swapchain surface. `descriptor` is the
+/// JSON form of `{ width, height, label? }`. Allocates a GPU-capable
+/// native view (see [`surface_view`]) and builds the `wgpu::Surface`.
+/// Returns a numeric surface handle, or `0` on failure (bad JSON, no
+/// view available on this platform, or surface creation rejected).
+///
+/// The created view is retained for the surface's lifetime; retrieve its
+/// pointer with `surfaceGetViewPtr` and embed it via perry-ui.
+///
+/// # Safety
+///
+/// `descriptor_ptr` must be a Perry-runtime `StringHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_webgpu_request_surface(descriptor_ptr: *const StringHeader) -> Handle {
+    #[derive(Deserialize)]
+    struct SurfaceDescriptor {
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        #[allow(dead_code)]
+        label: Option<String>,
+    }
+
+    let Some(json) = read_str(descriptor_ptr) else {
+        return 0;
+    };
+    let desc: SurfaceDescriptor = match serde_json::from_str(&json) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    let Some(view) = surface_view::create(desc.width.max(1), desc.height.max(1)) else {
+        return 0;
+    };
+
+    // SAFETY: the handles describe the live view we just created; it
+    // outlives the surface because the wrapper holds a +1 ref (released
+    // in `surfaceDrop`).
+    let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+        raw_display_handle: view.display_handle,
+        raw_window_handle: view.window_handle,
+    };
+    match instance().create_surface_unsafe(target) {
+        Ok(surface) => register_handle(WGPUSurface {
+            surface,
+            owned_view: view.view_ptr,
+            view_ptr: view.view_ptr,
+            config: Mutex::new(None),
+            current: Mutex::new(None),
+            issued_tex: Mutex::new(0),
+        }),
+        Err(e) => {
+            eprintln!("webgpu requestSurface: create_surface failed: {e}");
+            surface_view::destroy(view.view_ptr);
+            0
+        }
+    }
+}
+
+/// Wrap a native view/window the host already created into a wgpu
+/// surface — the inverse of `requestSurface`. `view_ptr` is interpreted
+/// per platform: `NSView*` (macOS), `UIView*` (iOS), `HWND` (Windows),
+/// `ANativeWindow*` (Android). The view must be GPU-capable (e.g. a
+/// `CAMetalLayer`-backed view on Apple platforms). We do **not** take
+/// ownership — the host keeps managing the view's lifetime, which must
+/// outlive the surface. Returns `0` if `view_ptr` is null or the
+/// platform isn't wired.
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_from_native_view(view_ptr: i64) -> Handle {
+    if view_ptr == 0 {
+        return 0;
+    }
+    let Some((window_handle, display_handle)) = surface_view::wrap(view_ptr) else {
+        return 0;
+    };
+    let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+        raw_display_handle: display_handle,
+        raw_window_handle: window_handle,
+    };
+    // SAFETY: caller guarantees `view_ptr` references a live GPU-capable
+    // view that outlives the returned surface.
+    match unsafe { instance().create_surface_unsafe(target) } {
+        Ok(surface) => register_handle(WGPUSurface {
+            surface,
+            owned_view: 0, // borrowed — never released by us
+            view_ptr,
+            config: Mutex::new(None),
+            current: Mutex::new(None),
+            issued_tex: Mutex::new(0),
+        }),
+        Err(e) => {
+            eprintln!("webgpu surfaceFromNativeView: create_surface failed: {e}");
+            0
+        }
+    }
+}
+
+/// The native view pointer backing this surface — pass it to perry-ui's
+/// `embedNativeView()` to mount the surface in the widget tree. Returns
+/// `0` for an unknown handle.
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_get_view_ptr(surface_handle: Handle) -> i64 {
+    with_handle::<WGPUSurface, _, _>(surface_handle, |s| s.view_ptr).unwrap_or(0)
+}
+
+/// `navigator.gpu.getPreferredCanvasFormat()` (queried per-surface so we
+/// can validate it against the chosen adapter). Returns the surface's
+/// first supported format as a string, or `"bgra8unorm"` if the handle
+/// pair is unknown. The returned `i64` is a `*StringHeader` address —
+/// declared `i64_str` in the manifest.
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_get_preferred_format(
+    surface_handle: Handle,
+    adapter_handle: Handle,
+) -> i64 {
+    let fmt = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        with_handle::<WGPUAdapter, _, _>(adapter_handle, |a| {
+            s.surface.get_capabilities(&a.0).formats.first().copied()
+        })
+        .flatten()
+    })
+    .flatten();
+    let name = fmt.map(surface_format_to_str).unwrap_or("bgra8unorm");
+    perry_ffi::alloc_string(name).as_raw() as i64
+}
+
+/// `context.configure(configuration)` — bind the surface to a device and
+/// swapchain format. `descriptor` is the JSON form of a
+/// `GPUCanvasConfiguration` extended with the native swapchain knobs:
+/// `{ device, format, usage?, alphaMode?, width, height, presentMode?,
+/// viewFormats? }`. `width`/`height` are required here (the browser
+/// reads them from the canvas element; natively we have no element).
+///
+/// # Safety
+///
+/// `descriptor_ptr` must be a Perry-runtime `StringHeader`.
+#[no_mangle]
+pub unsafe extern "C" fn js_webgpu_surface_configure(
+    surface_handle: Handle,
+    descriptor_ptr: *const StringHeader,
+) {
+    #[derive(Deserialize)]
+    struct CanvasConfig {
+        device: Handle,
+        format: String,
+        #[serde(default)]
+        usage: Option<u32>,
+        #[serde(rename = "alphaMode", default)]
+        alpha_mode: Option<String>,
+        width: u32,
+        height: u32,
+        #[serde(rename = "presentMode", default)]
+        present_mode: Option<String>,
+        #[serde(rename = "viewFormats", default)]
+        view_formats: Vec<String>,
+    }
+
+    let Some(json) = read_str(descriptor_ptr) else {
+        return;
+    };
+    let cfg: CanvasConfig = match serde_json::from_str(&json) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let config = wgpu::SurfaceConfiguration {
+        // Spec default for a canvas context is RENDER_ATTACHMENT.
+        usage: cfg
+            .usage
+            .map(wgpu::TextureUsages::from_bits_truncate)
+            .unwrap_or(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        format: parse_texture_format(&cfg.format),
+        width: cfg.width.max(1),
+        height: cfg.height.max(1),
+        present_mode: parse_present_mode(cfg.present_mode.as_deref()),
+        alpha_mode: parse_alpha_mode(cfg.alpha_mode.as_deref()),
+        view_formats: cfg
+            .view_formats
+            .iter()
+            .map(|s| parse_texture_format(s))
+            .collect(),
+        desired_maximum_frame_latency: 2,
+    };
+
+    let _ = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        let applied = with_handle::<WGPUDevice, _, _>(cfg.device, |d| {
+            s.surface.configure(&d.0, &config);
+        })
+        .is_some();
+        if applied {
+            *s.config.lock() = Some(config.clone());
+        }
+    });
+}
+
+/// `context.getCurrentTexture()` — acquire the next swapchain image.
+/// Returns a texture handle (a [`WGPUSurfaceTexture`]) usable with
+/// `textureCreateView` exactly like a device texture; the view is the
+/// render-pass color attachment for this frame. Returns `0` if the
+/// surface is unconfigured or the swapchain is lost (reconfigure and
+/// retry, per the spec). Call `surfacePresent` after submitting the
+/// frame's command buffers.
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_get_current_texture(surface_handle: Handle) -> Handle {
+    let acquired = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        match s.surface.get_current_texture() {
+            Ok(st) => {
+                *s.current.lock() = Some(st);
+                true
+            }
+            Err(e) => {
+                eprintln!("webgpu surfaceGetCurrentTexture: {e}");
+                false
+            }
+        }
+    })
+    .unwrap_or(false);
+    if !acquired {
+        return 0;
+    }
+
+    let tex_handle = register_handle(WGPUSurfaceTexture { surface_handle });
+    // Drop a prior frame's handle the caller never presented, so the
+    // registry doesn't grow one entry per frame.
+    let _ = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        let prev = std::mem::replace(&mut *s.issued_tex.lock(), tex_handle);
+        if prev != 0 {
+            let _ = take_handle::<WGPUSurfaceTexture>(prev);
+            drop_handle(prev);
+        }
+    });
+    tex_handle
+}
+
+/// Present the frame previously acquired by `getCurrentTexture`. The
+/// browser presents implicitly at the end of the task that drew; native
+/// wgpu requires an explicit hand-back, so this is a spec-extra (the one
+/// call a ported render loop must add). No-op if nothing is in flight.
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_present(surface_handle: Handle) {
+    let _ = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        if let Some(st) = s.current.lock().take() {
+            st.present();
+        }
+        let prev = std::mem::replace(&mut *s.issued_tex.lock(), 0);
+        if prev != 0 {
+            let _ = take_handle::<WGPUSurfaceTexture>(prev);
+            drop_handle(prev);
+        }
+    });
+}
+
+/// `context.unconfigure()` — drop the swapchain and any in-flight frame.
+/// The surface can be re-`configure`d afterwards (e.g. after a resize).
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_unconfigure(surface_handle: Handle) {
+    let _ = with_handle::<WGPUSurface, _, _>(surface_handle, |s| {
+        *s.current.lock() = None;
+        *s.config.lock() = None;
+        let prev = std::mem::replace(&mut *s.issued_tex.lock(), 0);
+        if prev != 0 {
+            let _ = take_handle::<WGPUSurfaceTexture>(prev);
+            drop_handle(prev);
+        }
+    });
+}
+
+/// Release the surface and, if we created its view, the native view too.
+/// Idempotent. (The wgpu `Surface` drops with the wrapper.)
+#[no_mangle]
+pub extern "C" fn js_webgpu_surface_drop(surface_handle: Handle) {
+    if let Some(s) = take_handle::<WGPUSurface>(surface_handle) {
+        let prev = *s.issued_tex.lock();
+        if prev != 0 {
+            let _ = take_handle::<WGPUSurfaceTexture>(prev);
+            drop_handle(prev);
+        }
+        if s.owned_view != 0 {
+            surface_view::destroy(s.owned_view);
+        }
+    }
+    drop_handle(surface_handle);
+}
+
+// ─── Per-platform native-view creation ──────────────────────────────
+//
+// `create` allocates a brand-new GPU-capable view (the `requestSurface`
+// path); `wrap` builds raw-window handles from a caller-supplied view
+// pointer (the `surfaceFromNativeView` path); `destroy` releases a view
+// `create` allocated. Only the host target's arm compiles.
+//
+// `wrap` needs nothing but `raw-window-handle`, so it is wired on every
+// platform that has a single unambiguous window-handle variant. `create`
+// is currently implemented for macOS (where wgpu's Metal HAL turns a
+// bare `NSView` into a `CAMetalLayer`-backed swapchain for us); other
+// desktop targets allocate their view through perry-ui and use `wrap`.
+mod surface_view {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
+    pub struct NativeView {
+        pub view_ptr: i64,
+        pub window_handle: RawWindowHandle,
+        pub display_handle: RawDisplayHandle,
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn create(width: u32, height: u32) -> Option<NativeView> {
+        use objc2::rc::Retained;
+        use objc2::MainThreadOnly;
+        use objc2_app_kit::NSView;
+        use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+        use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle};
+        use std::ptr::NonNull;
+
+        // A swapchain view must be created on the main thread — bail
+        // clearly rather than tripping AppKit's own assertion deep in
+        // wgpu if a worker called us.
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("webgpu requestSurface: must be called on the main thread");
+            return None;
+        };
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(width as f64, height as f64),
+        );
+        // Standard AppKit alloc/init on the main thread (`mtm` proves it).
+        let view = {
+            let v = NSView::initWithFrame(NSView::alloc(mtm), frame);
+            // `wantsLayer` lets wgpu attach a CAMetalLayer to this view.
+            v.setWantsLayer(true);
+            v
+        };
+        // Leak a +1 reference: the surface owns the view for its
+        // lifetime. perry-ui's `embedNativeView` retains its own +1, so
+        // the view survives until both release it. `destroy` reclaims
+        // this ref.
+        let raw: *mut NSView = Retained::into_raw(view);
+        let ns_view = NonNull::new(raw as *mut std::ffi::c_void)?;
+        Some(NativeView {
+            view_ptr: raw as i64,
+            window_handle: RawWindowHandle::AppKit(AppKitWindowHandle::new(ns_view)),
+            display_handle: RawDisplayHandle::AppKit(AppKitDisplayHandle::new()),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn create(_width: u32, _height: u32) -> Option<NativeView> {
+        // Only macOS can allocate the view itself today. On other
+        // platforms the toolkit owns view creation — make the view via
+        // perry-ui and adopt it with `surfaceFromNativeView`.
+        eprintln!(
+            "webgpu requestSurface: window creation is only wired on macOS; \
+             create the platform view via perry-ui and pass its pointer to \
+             surfaceFromNativeView()"
+        );
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn destroy(view_ptr: i64) {
+        use objc2::rc::Retained;
+        use objc2_app_kit::NSView;
+        if view_ptr == 0 {
+            return;
+        }
+        // Reclaim the +1 leaked in `create`; dropping releases it.
+        // SAFETY: `view_ptr` came from `Retained::into_raw` in `create`
+        // and is released exactly once (guarded by `owned_view != 0`).
+        unsafe {
+            let _ = Retained::from_raw(view_ptr as *mut NSView);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn destroy(_view_ptr: i64) {}
+
+    /// Build `(window, display)` raw handles from a caller-supplied
+    /// native view pointer. Returns `None` on platforms whose handle is
+    /// ambiguous from a single pointer (e.g. X11/Wayland, which also
+    /// need a display connection) — those need a richer entry point.
+    #[allow(unused_variables)]
+    pub fn wrap(view_ptr: i64) -> Option<(RawWindowHandle, RawDisplayHandle)> {
+        use std::ptr::NonNull;
+        #[cfg(target_os = "macos")]
+        {
+            use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle};
+            let v = NonNull::new(view_ptr as *mut std::ffi::c_void)?;
+            Some((
+                RawWindowHandle::AppKit(AppKitWindowHandle::new(v)),
+                RawDisplayHandle::AppKit(AppKitDisplayHandle::new()),
+            ))
+        }
+        #[cfg(target_os = "ios")]
+        {
+            use raw_window_handle::{UiKitDisplayHandle, UiKitWindowHandle};
+            let v = NonNull::new(view_ptr as *mut std::ffi::c_void)?;
+            Some((
+                RawWindowHandle::UiKit(UiKitWindowHandle::new(v)),
+                RawDisplayHandle::UiKit(UiKitDisplayHandle::new()),
+            ))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
+            let hwnd = std::num::NonZeroIsize::new(view_ptr as isize)?;
+            Some((
+                RawWindowHandle::Win32(Win32WindowHandle::new(hwnd)),
+                RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+            ))
+        }
+        #[cfg(target_os = "android")]
+        {
+            use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle};
+            // `view_ptr` is an `ANativeWindow*` (e.g. from
+            // `ANativeWindow_fromSurface`), not a Java `View`.
+            let w = NonNull::new(view_ptr as *mut std::ffi::c_void)?;
+            Some((
+                RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(w)),
+                RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+            ))
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "windows",
+            target_os = "android"
+        )))]
+        {
+            // X11/Wayland need a display connection alongside the window,
+            // which a single pointer can't carry — see the README's
+            // platform-status note.
+            eprintln!(
+                "webgpu surfaceFromNativeView: not wired on this platform \
+                 (X11/Wayland need a display handle too)"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

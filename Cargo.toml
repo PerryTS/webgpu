@@ -50,3 +50,41 @@ parking_lot = "0.12"
 # argument exactly as in the spec).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# On-screen surface (`GPUSurface` / `GPUCanvasContext`). We build a
+# native view per platform and hand its raw handle to wgpu's
+# `create_surface_unsafe`, so we depend on `raw-window-handle` directly
+# (the same 0.6 line wgpu 22 re-exports). The native view is then handed
+# to perry-ui's `perry_ui_embed_*` hook by the caller — see the
+# "On-screen surface" section in lib.rs.
+raw-window-handle = "0.6"
+
+# ─── Per-platform native-view creation ──────────────────────────────
+#
+# Versions track the `perry-ui-*` backends so the linked binary pulls a
+# single copy of each objc2 / windows / jni crate. Only the host
+# target's block compiles; wgpu's HAL turns the bare view handle into a
+# swapchain-capable layer (CAMetalLayer / DXGI / Vulkan surface).
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = ["NSView", "NSResponder"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+objc2-ui-kit = { version = "0.3", features = ["UIView", "UIResponder"] }
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CALayer"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = "0.9"

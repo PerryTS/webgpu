@@ -193,15 +193,80 @@ The one un-spec-y thing is the **flat function shape**: `deviceCreateBuffer(devi
 - **Queue**: `submit` / `writeBuffer` / `writeTexture` / `onSubmittedWorkDone` (real device-poll, not a stub)
 - **QuerySet**: `deviceCreateQuerySet` (occlusion + timestamp) / `querySetDestroy`
 - **Error scopes**: `devicePushErrorScope` / `devicePopErrorScope` (real wgpu errorScope wired through, returning `{type, message}` JSON)
+- **Surface (on-screen)**: `requestSurface` / `surfaceFromNativeView` / `surfaceGetViewPtr` / `surfaceGetPreferredFormat` / `surfaceConfigure` / `surfaceGetCurrentTexture` / `surfacePresent` / `surfaceUnconfigure` / `surfaceDrop` — render a swapchain into a perry-ui window
+
+## On-screen surface
+
+WebGPU presents to a window through a swapchain. The browser hides this behind `canvas.getContext("webgpu")`; natively, wgpu builds a `Surface` from a platform window/view handle. Perry programs are headless by default, so the on-screen path rides on **perry-ui**: its `BloomView` widget ("render-surface host for an external GPU renderer") reserves a GPU-capable native view in the window and hands back the platform handle. `@perryts/webgpu` *wraps* that handle into a swapchain — it never creates windows itself, so compute / render-to-texture programs still link without dragging in the UI toolkit.
+
+The render loop is the spec's, plus one explicit `surfacePresent` (browsers present implicitly at task end; native wgpu needs the hand-back). A complete, runnable program is in [`examples/triangle-macos`](examples/triangle-macos/) — the shape is:
+
+```typescript
+import { App, BloomView, bloomViewGetNativeHandle, onFrame } from "perry/ui";
+import {
+  requestAdapter, adapterRequestDevice,
+  surfaceFromNativeView, surfaceGetPreferredFormat, surfaceConfigure,
+  surfaceGetCurrentTexture, surfacePresent, textureCreateView,
+  deviceCreateCommandEncoder, commandEncoderBeginRenderPass,
+  renderPassSetPipeline, renderPassDraw, renderPassEnd,
+  commandEncoderFinish, queueSubmit,
+} from "@perryts/webgpu";
+
+const view = BloomView(800, 600);                  // perry-ui reserves the native view
+const adapter = await requestAdapter();
+const { device, queue } = await adapterRequestDevice(adapter);
+
+const surface = surfaceFromNativeView(bloomViewGetNativeHandle(view)); // wrap it
+const format = surfaceGetPreferredFormat(surface, adapter);
+surfaceConfigure(surface, { device, format, width: 800, height: 600 });
+
+// …build `pipeline` against `format` exactly as in the browser…
+
+onFrame(function frame() {
+  const tex = surfaceGetCurrentTexture(surface);   // this frame's swapchain image
+  const target = textureCreateView(tex);           // → render-pass color attachment
+  const enc = deviceCreateCommandEncoder(device);
+  const pass = commandEncoderBeginRenderPass(enc, {
+    colorAttachments: [{ view: target, loadOp: "clear", storeOp: "store",
+                         clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+  });
+  renderPassSetPipeline(pass, pipeline);
+  renderPassDraw(pass, 3);
+  renderPassEnd(pass);
+  queueSubmit(queue, JSON.stringify([commandEncoderFinish(enc)]));
+  surfacePresent(surface);                         // hand the frame to the compositor
+});
+
+App({ title: "WebGPU Triangle", width: 800, height: 600, body: view });
+```
+
+> **Main-thread note**: `onFrame` fires on perry-ui's main-thread frame pump, so each `getCurrentTexture` + `surfacePresent` blocks it on GPU/vsync sync. Render only as often as the image actually changes — a static scene can render a short burst and stop re-registering; the `CAMetalLayer` keeps showing the last presented frame and the UI stays responsive. (See the example.)
+
+`surfaceFromNativeView(ptr)` is the canonical seam, and the one a future "wrap an existing wgpu device" bloom entry point builds on (see below). `requestSurface({ width, height })` is the inverse — the binding allocates its *own* `NSView` and returns its pointer via `surfaceGetViewPtr` for the host to embed; it's macOS-only today, since other toolkits own view creation.
+
+### Requirements
+
+The ergonomic camelCase API (`requestAdapter`, not `js_webgpu_request_adapter`) routes to native through Perry's native-library support, which needs a Perry build with **ergonomic-export routing** ([PerryTS/perry#5621](https://github.com/PerryTS/perry/issues/5621)) and the **`json` descriptor param type** ([#5626](https://github.com/PerryTS/perry/issues/5626)). The package manifest declares each target's `crate` + `lib` and marks descriptor params `json` accordingly.
+
+### Platform status
+
+| Platform | View creation (`requestSurface`) | Adopt existing (`surfaceFromNativeView`) | Backend |
+|----------|----------------------------------|------------------------------------------|---------|
+| macOS    | ✅ implemented & verified (`NSView` → `CAMetalLayer`) | ✅ (`NSView*`) | Metal |
+| iOS      | — (UIKit owns the view) | ✅ (`UIView*`, must be `CAMetalLayer`-backed) | Metal |
+| Windows  | — (create the `HWND` via perry-ui) | ✅ (`HWND`) | DX12 / Vulkan |
+| Android  | — (the framework owns the `Surface`) | ✅ (`ANativeWindow*`) | Vulkan |
+| Linux    | — | ⏳ needs a display handle alongside the window (X11/Wayland) — follow-up | Vulkan |
+
+**macOS is verified end-to-end** — [`examples/triangle-macos`](examples/triangle-macos/) renders a live triangle into a perry-ui window. The other arms compile against their platform window handles but await on-device validation. Mobile and Windows invert view ownership (the toolkit/OS creates the view), so they go through `surfaceFromNativeView` with the toolkit's pointer rather than `requestSurface`. Linux still needs a richer entry point because a single pointer can't carry the X11/Wayland display connection wgpu also requires.
 
 ## Out of scope
 
-- **`GPUSurface` / on-screen canvas**: window-bound, follow-up ticket (the issue's "On-screen canvas widget (separate ticket)" carve-out). Off-screen render-to-texture is fully supported via the v0.2 surface above.
 - **External textures**: depend on the canvas integration crate exposing `ImageBitmap` (#570 acceptance criterion); the descriptor parser treats the v0.2 wire format as a forwards-compatible no-op.
 
 ## Bloom interop
 
-Out of scope for this version — every adapter/device is freshly allocated. The bloom-side hook is a future addition: bloom will expose its `wgpu::Device` + `wgpu::Queue` via a stable internal API, and `@perryts/webgpu` will gain a "wrap an existing device" entry point so a user can drop into raw WebGPU for a custom pass inside a bloom app.
+Out of scope for this version — every adapter/device is freshly allocated. The bloom-side hook is a future addition: bloom will expose its `wgpu::Device` + `wgpu::Queue` via a stable internal API, and `@perryts/webgpu` will gain a "wrap an existing device" entry point so a user can drop into raw WebGPU for a custom pass inside a bloom app. The surface side already has its half of that seam — `surfaceFromNativeView` wraps a view bloom hands over — so the remaining work is the device/queue adoption path.
 
 ## Versioning
 

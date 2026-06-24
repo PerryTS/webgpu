@@ -31,6 +31,10 @@
  *   onSubmittedWorkDone
  * - **QuerySet**: occlusion + timestamp
  * - **Error scopes**: pushErrorScope / popErrorScope
+ * - **Surface (on-screen)**: requestSurface / surfaceFromNativeView /
+ *   surfaceGetViewPtr / surfaceGetPreferredFormat / surfaceConfigure /
+ *   surfaceGetCurrentTexture / surfacePresent / surfaceUnconfigure /
+ *   surfaceDrop — swapchain into a perry-ui window
  *
  * # Why a flat functional surface
  *
@@ -105,6 +109,15 @@ export type GPUTexture = number & { readonly __webgpuTexture: unique symbol };
 export type GPUTextureView = number & { readonly __webgpuTextureView: unique symbol };
 export type GPUSampler = number & { readonly __webgpuSampler: unique symbol };
 export type GPUQuerySet = number & { readonly __webgpuQuerySet: unique symbol };
+/**
+ * An on-screen swapchain surface. Stands in for the spec's
+ * `GPUCanvasContext` (there's no `<canvas>` element natively) — created
+ * with {@link requestSurface}, mounted into a perry-ui window via
+ * {@link surfaceGetViewPtr} + `embedNativeView`, then driven with
+ * {@link surfaceConfigure} / {@link surfaceGetCurrentTexture} /
+ * {@link surfacePresent}.
+ */
+export type GPUSurface = number & { readonly __webgpuSurface: unique symbol };
 
 // ═══════════════════════════════════════════════════════════════════
 // Spec enum constants — runtime values, mirror the W3C spec exactly
@@ -1130,5 +1143,132 @@ export function devicePushErrorScope(
  * map to `null`, matching the spec).
  */
 export function devicePopErrorScope(_device: GPUDevice): Promise<string> {
+  throw new Error(NOT_NATIVE);
+}
+
+// ─── On-screen surface (GPUSurface / GPUCanvasContext) ─────────────
+
+/** `GPUCanvasAlphaMode` — how the swapchain composites with the window. */
+export type GPUCanvasAlphaMode =
+  | "opaque"
+  | "premultiplied"
+  | "postmultiplied"
+  | "inherit"
+  | "auto";
+
+/**
+ * Swapchain present mode. Spec-extra (the browser picks this for you);
+ * `"fifo"` is vsync and the safe default supported everywhere.
+ */
+export type GPUPresentMode = "fifo" | "fifo-relaxed" | "immediate" | "mailbox";
+
+/** Descriptor for {@link requestSurface}. */
+export interface GPUSurfaceDescriptor {
+  /** Initial backing-view size in physical pixels. */
+  width: number;
+  height: number;
+  label?: string;
+}
+
+/**
+ * `GPUCanvasConfiguration`, extended with the native swapchain knobs the
+ * browser infers from the `<canvas>` element. `width`/`height` are
+ * required here since there is no element to read them from.
+ */
+export interface GPUCanvasConfiguration {
+  device: GPUDevice;
+  format: GPUTextureFormat;
+  /** Defaults to `GPUTextureUsage.RENDER_ATTACHMENT`. */
+  usage?: number;
+  alphaMode?: GPUCanvasAlphaMode;
+  width: number;
+  height: number;
+  /** Spec-extra; defaults to `"fifo"`. */
+  presentMode?: GPUPresentMode;
+  viewFormats?: GPUTextureFormat[];
+}
+
+/**
+ * Allocate an on-screen swapchain surface backed by a fresh native view.
+ *
+ * Currently the view is allocated natively on macOS; on other platforms
+ * create the platform view through perry-ui and adopt it with
+ * {@link surfaceFromNativeView} instead. Must be called on the main
+ * thread.
+ *
+ * After creating the surface, mount it: `embedNativeView(surfaceGetViewPtr(s))`
+ * (from `@perryts/ui`), then `surfaceConfigure(s, …)` and run the render
+ * loop. Throws under the V8 fallback.
+ */
+export function requestSurface(_descriptor: GPUSurfaceDescriptor): GPUSurface {
+  throw new Error(NOT_NATIVE);
+}
+
+/**
+ * Wrap a native view the host already created (the inverse of
+ * {@link requestSurface}). `viewPtr` is a platform handle: `NSView*`
+ * (macOS), `UIView*` (iOS), `HWND` (Windows), or `ANativeWindow*`
+ * (Android). The view must be GPU-capable and outlive the surface; we do
+ * not take ownership of it.
+ */
+export function surfaceFromNativeView(_viewPtr: number): GPUSurface {
+  throw new Error(NOT_NATIVE);
+}
+
+/**
+ * The native view pointer backing the surface — pass it to
+ * `@perryts/ui`'s `embedNativeView()` to mount it in the widget tree.
+ */
+export function surfaceGetViewPtr(_surface: GPUSurface): number {
+  throw new Error(NOT_NATIVE);
+}
+
+/**
+ * The surface's preferred swapchain format for the given adapter —
+ * the native analogue of `navigator.gpu.getPreferredCanvasFormat()`.
+ * Feed it straight into {@link surfaceConfigure}'s `format`.
+ */
+export function surfaceGetPreferredFormat(
+  _surface: GPUSurface,
+  _adapter: GPUAdapter
+): GPUTextureFormat {
+  throw new Error(NOT_NATIVE);
+}
+
+/** `context.configure(configuration)` — bind device + swapchain format. */
+export function surfaceConfigure(
+  _surface: GPUSurface,
+  _configuration: GPUCanvasConfiguration
+): void {
+  throw new Error(NOT_NATIVE);
+}
+
+/**
+ * `context.getCurrentTexture()` — acquire this frame's swapchain image.
+ * The returned texture is usable with {@link textureCreateView} just
+ * like a device texture (it is the render-pass color attachment). Call
+ * {@link surfacePresent} once the frame's command buffers are submitted.
+ */
+export function surfaceGetCurrentTexture(_surface: GPUSurface): GPUTexture {
+  throw new Error(NOT_NATIVE);
+}
+
+/**
+ * Present the frame acquired by {@link surfaceGetCurrentTexture}.
+ * Spec-extra: browsers present implicitly at task end; native wgpu
+ * needs this explicit hand-back, so it's the one call a ported render
+ * loop must add after `queueSubmit`.
+ */
+export function surfacePresent(_surface: GPUSurface): void {
+  throw new Error(NOT_NATIVE);
+}
+
+/** `context.unconfigure()` — drop the swapchain (e.g. before a resize). */
+export function surfaceUnconfigure(_surface: GPUSurface): void {
+  throw new Error(NOT_NATIVE);
+}
+
+/** Release the surface and, if `requestSurface` created it, its view. Idempotent. */
+export function surfaceDrop(_surface: GPUSurface): void {
   throw new Error(NOT_NATIVE);
 }
