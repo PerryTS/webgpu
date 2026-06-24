@@ -1,0 +1,16 @@
+{
+  "name": "webgpu-triangle-macos",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Minimal on-screen WebGPU triangle in a perry-ui window.",
+  "dependencies": {
+    "@perryts/webgpu": "*"
+  },
+  "perry": {
+    "allow": {
+      "nativeLibrary": [
+        "@perryts/webgpu"
+      ]
+    }
+  }
+}

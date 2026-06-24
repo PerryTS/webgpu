@@ -1,0 +1,6 @@
+# Build artifacts
+/triangle
+*.o
+WebGPUTriangle.app/
+# Local package link (created via the setup step in README)
+node_modules
